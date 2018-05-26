@@ -1373,8 +1373,6 @@ static inline unsigned int do_avg_nr_running(struct rq *rq)
 
 static inline void inc_nr_running(struct rq *rq)
 {
-#endif
-}
 	sched_update_nr_prod(cpu_of(rq), 1, true);
 	rq->nr_running++;
 
