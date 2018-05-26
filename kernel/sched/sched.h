@@ -1336,8 +1336,6 @@ static inline u64 steal_ticks(u64 steal)
 
 static inline void inc_nr_running(struct rq *rq)
 {
-#endif
-}
 	sched_update_nr_prod(cpu_of(rq), 1, true);
 	rq->nr_running++;
 
