@@ -18,11 +18,7 @@
 #include <linux/slab.h>
 #include <linux/input.h>
 #include <linux/kobject.h>
-#ifdef CONFIG_STATE_NOTIFIER
-#include <linux/state_notifier.h>
-#else
 #include <linux/fb.h>
-#endif
 #include <linux/cpufreq.h>
 
 #define INTELLI_PLUG			"intelli_plug"
@@ -63,6 +59,7 @@ static u64 last_boost_time, last_input;
 static struct delayed_work intelli_plug_work;
 static struct work_struct up_down_work;
 static struct workqueue_struct *intelliplug_wq;
+static struct workqueue_struct *susp_wq;
 static struct delayed_work suspend_work;
 static struct work_struct resume_work;
 static struct mutex intelli_plug_mutex;
@@ -303,7 +300,8 @@ static void intelli_plug_suspend(struct work_struct *work)
 		full_mode_profile != 3)
 		return;
 
-	/* Cancel work */
+	/* Flush hotplug workqueue */
+	flush_workqueue(intelliplug_wq);
 	cancel_delayed_work_sync(&intelli_plug_work);
 
 	/* Put all sibling cores to sleep */
@@ -356,7 +354,7 @@ static void __intelli_plug_suspend(void)
 		return;
 
 	INIT_DELAYED_WORK(&suspend_work, intelli_plug_suspend);
-	queue_delayed_work_on(0, intelliplug_wq, &suspend_work, 
+	queue_delayed_work_on(0, susp_wq, &suspend_work, 
 				 msecs_to_jiffies(suspend_defer_time * 1000)); 
 }
 
@@ -365,29 +363,11 @@ static void __intelli_plug_resume(void)
 	if (atomic_read(&intelli_plug_active) == 0)
 		return;
 
-	flush_workqueue(intelliplug_wq);
+	flush_workqueue(susp_wq);
 	cancel_delayed_work_sync(&suspend_work);
-	queue_work_on(0, intelliplug_wq, &resume_work);
+	queue_work_on(0, susp_wq, &resume_work);
 }
 
-#ifdef CONFIG_STATE_NOTIFIER
-static int state_notifier_callback(struct notifier_block *this,
-				unsigned long event, void *data)
-{
-	switch (event) {
-		case STATE_NOTIFIER_ACTIVE:
-			__intelli_plug_resume();
-			break;
-		case STATE_NOTIFIER_SUSPEND:
-			__intelli_plug_suspend();
-			break;
-		default:
-			break;
-	}
-
-	return NOTIFY_OK;
-}
-#else
 static int prev_fb = FB_BLANK_UNBLANK;
 
 static int fb_notifier_callback(struct notifier_block *self,
@@ -416,7 +396,6 @@ static int fb_notifier_callback(struct notifier_block *self,
 
 	return NOTIFY_OK;
 }
-#endif
 
 static void intelli_plug_input_event(struct input_handle *handle,
 		unsigned int type, unsigned int code, int value)
@@ -513,7 +492,7 @@ static int __ref intelli_plug_start(void)
 	int cpu, ret = 0;
 	struct down_lock *dl;
 
-	intelliplug_wq = create_freezable_workqueue("intelliplug");
+	intelliplug_wq = alloc_workqueue("intelliplug", WQ_HIGHPRI | WQ_FREEZABLE, 0);
 	if (!intelliplug_wq) {
 		pr_err("%s: Failed to allocate hotplug workqueue\n",
 		       INTELLI_PLUG);
@@ -521,20 +500,21 @@ static int __ref intelli_plug_start(void)
 		goto err_out;
 	}
 
-	notif.notifier_call = state_notifier_callback;
-	if (state_register_client(&notif)) {
-		pr_err("%s: Failed to register State notifier callback\n",
-			INTELLI_PLUG);
-		goto err_dev;
+	susp_wq =
+	    alloc_workqueue("intelli_susp_wq", WQ_FREEZABLE, 0);
+	if (!susp_wq) {
+		pr_err("%s: Failed to allocate suspend workqueue\n",
+		       INTELLI_PLUG);
+		ret = -ENOMEM;
+		goto err_out;
 	}
-#else
+
 	notif.notifier_call = fb_notifier_callback;
 	if (fb_register_client(&notif)) {
 		pr_err("%s: Failed to register FB notifier callback\n",
 			INTELLI_PLUG);
 		goto err_dev;
 	}
-#endif
 
 	ret = input_register_handler(&intelli_plug_input_handler);
 	if (ret) {
@@ -578,25 +558,23 @@ static void intelli_plug_stop(void)
 	int cpu;
 	struct down_lock *dl;
 
+	flush_workqueue(susp_wq);
+	cancel_work_sync(&resume_work);
+	cancel_delayed_work_sync(&suspend_work);
 
 	for_each_possible_cpu(cpu) {
 		dl = &per_cpu(lock_info, cpu);
 		cancel_delayed_work_sync(&dl->lock_rem);
 	}
 	flush_workqueue(intelliplug_wq);
-	cancel_work_sync(&resume_work);
-	cancel_delayed_work_sync(&suspend_work);
 	cancel_work_sync(&up_down_work);
 	cancel_delayed_work_sync(&intelli_plug_work);
 	mutex_destroy(&intelli_plug_mutex);
-#ifdef CONFIG_STATE_NOTIFIER
-	state_unregister_client(&notif);
-#else
 	fb_unregister_client(&notif);
-#endif
 	notif.notifier_call = NULL;
 
 	input_unregister_handler(&intelli_plug_input_handler);
+	destroy_workqueue(susp_wq);
 	destroy_workqueue(intelliplug_wq);
 }
 
@@ -844,3 +822,5 @@ MODULE_AUTHOR("Paul Reioux <reioux@gmail.com>");
 MODULE_DESCRIPTION("'intell_plug' - An intelligent cpu hotplug driver for "
 	"Low Latency Frequency Transition capable processors");
 MODULE_LICENSE("GPLv2");
+
+
